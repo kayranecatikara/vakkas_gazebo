@@ -153,7 +153,7 @@ def main():
                     help="UDP port of the target_vision driver")
     ap.add_argument("--rate", type=float, default=30.0,
                     help="detection rate [Hz]")
-    ap.add_argument("--max-range", type=float, default=50.0,
+    ap.add_argument("--max-range", type=float, default=75.0,
                     help="max detection range [m]")
     ap.add_argument("--hfov", type=float, default=None,
                     help="camera HFOV [deg], default: from interceptor.yaml")
@@ -441,21 +441,33 @@ def main():
                 pts_f = pts_cam[in_front]
                 u_raw = fx * pts_f[:, 0] / pts_f[:, 2] + cx
                 v_raw = fy * pts_f[:, 1] / pts_f[:, 2] + cy
-                # the whole silhouette must be in the image: a target cut by the edge is not visible
-                inside = (u_raw.min() >= 0 and u_raw.max() <= width and
-                          v_raw.min() >= 0 and v_raw.max() <= height)
-                u = np.clip(u_raw, 0, width)
-                v = np.clip(v_raw, 0, height)
-                u_min, u_max = u.min(), u.max()
-                v_min, v_max = v.min(), v.max()
-                bw, bh = u_max - u_min, v_max - v_min
-                if bw > 0.5 and bh > 0.5 and inside:
+                # Unclipped bounding box of the full target
+                u_raw_min, u_raw_max = float(u_raw.min()), float(u_raw.max())
+                v_raw_min, v_raw_max = float(v_raw.min()), float(v_raw.max())
+                bw_raw = u_raw_max - u_raw_min
+                bh_raw = v_raw_max - v_raw_min
+                raw_area = bw_raw * bh_raw
+
+                # Clipped bounding box within the image frame [0, width] x [0, height]
+                u_clip_min = max(0.0, u_raw_min)
+                u_clip_max = min(float(width), u_raw_max)
+                v_clip_min = max(0.0, v_raw_min)
+                v_clip_max = min(float(height), v_raw_max)
+                bw_clip = max(0.0, u_clip_max - u_clip_min)
+                bh_clip = max(0.0, v_clip_max - v_clip_min)
+                vis_area = bw_clip * bh_clip
+
+                # Rule: Detection is lost if more than 1/3 of the target (bbox)
+                # is outside the image (i.e. at least 2/3 (66.7%) of bbox area remains inside).
+                vis_ratio = (vis_area / raw_area) if raw_area > 0 else 0.0
+
+                if bw_clip > 0.5 and bh_clip > 0.5 and vis_ratio >= (2.0 / 3.0):
                     visible = True
                     bbox = [
-                        float((u_min + u_max) / 2 / width),   # cx normalised
-                        float((v_min + v_max) / 2 / height),  # cy normalised
-                        float(bw / width),                     # w normalised
-                        float(bh / height),                    # h normalised
+                        float((u_clip_min + u_clip_max) / 2.0 / width),   # cx normalised [0, 1]
+                        float((v_clip_min + v_clip_max) / 2.0 / height),  # cy normalised [0, 1]
+                        float(bw_clip / width),                           # w normalised
+                        float(bh_clip / height),                          # h normalised
                     ]
                     last_visible = True
                     last_bbox = bbox

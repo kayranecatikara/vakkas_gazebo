@@ -186,8 +186,11 @@ void Intercept::UpdateVisualDetection()
 		}
 	}
 
-	if (_visual_contact && (hrt_elapsed_time(&_last_visual_contact) > 1500_ms)) {
-		PX4_WARN("Visual contact lost (>1.5s)");
+	const float lost_timeout_s = math::max(_param_int_lost_timeout.get(), 0.2f);
+	const uint64_t lost_timeout_us = (uint64_t)(lost_timeout_s * 1e6f);
+
+	if (_visual_contact && (hrt_elapsed_time(&_last_visual_contact) > lost_timeout_us)) {
+		PX4_WARN("Visual contact lost (>%.1fs)", (double)lost_timeout_s);
 		_visual_contact = false;
 	}
 }
@@ -304,11 +307,11 @@ void Intercept::ComputeApproachGuidance(matrix::Vector3f &vel_cmd, float &yaw_cm
 	const float delta_z = intercept_point(2) - self_pos(2);
 	const float target_vz = _target_vel(2);
 	const float K_z_p = _param_int_kp_z_app.get();
-	const float vz_desired = math::constrain(target_vz + K_z_p * delta_z, -3.0f, 2.5f);
+	const float vz_desired = math::constrain(target_vz + K_z_p * delta_z, -7.5f, 3.5f);
 
-	// Slew-rate limit vertical velocity (max 2.0 m/s^2 acceleration) to prevent pitch hunting
+	// Slew-rate limit vertical velocity (max 5.0 m/s^2 acceleration) to rapidly match altitude
 	if (_last_cmd_valid && dt > 0.005f) {
-		const float max_dvz = 2.0f * dt;
+		const float max_dvz = 5.0f * dt;
 		vel_cmd(2) = math::constrain(vz_desired, _last_vel_cmd(2) - max_dvz, _last_vel_cmd(2) + max_dvz);
 	} else {
 		vel_cmd(2) = vz_desired;
@@ -415,12 +418,25 @@ void Intercept::ComputeClosePursuitGuidance(matrix::Vector3f &vel_cmd, float &ya
 		}
 	}
 
+	// Adaptive maneuver corner braking:
+	// If target drifts towards FOV edges beyond +/- 0.25 deadband ([0.25, 0.75]),
+	// gently brake forward speed proportionally to (size * lateral_drift) to tighten turn radius
+	const float lat_offset = fabsf(cx - 0.50f);
+	constexpr float LAT_BRAKE_DEADBAND = 0.25f; // +/- 0.25 deadband corridor ([0.25, 0.75])
+	float corner_brake = 0.0f;
+	if (lat_offset > LAT_BRAKE_DEADBAND) {
+		const float lat_drift = lat_offset - LAT_BRAKE_DEADBAND;
+		const float k_corner = _param_int_k_corner.get();
+		corner_brake = math::constrain(k_corner * w * lat_drift, 0.0f, 3.0f);
+	}
+	delta_v -= corner_brake;
+
 	// Clamp commanded velocity delta to prevent abrupt pitch swings
-	delta_v = math::constrain(delta_v, -4.0f, 5.0f);
+	delta_v = math::constrain(delta_v, -5.0f, 5.0f);
 
 	// Desired forward speed is referenced to vehicle's OWN actual ground speed
-	// Eliminates the double-integrator limit cycle without assuming target speed is known or constant!
-	const float desired_fwd_speed = math::constrain(current_fwd_speed + delta_v, 15.0f, 45.0f);
+	// Multicopter has no stall speed: allow slowing all the way down to hover (0.0 m/s) if needed during sharp maneuvers!
+	const float desired_fwd_speed = math::constrain(current_fwd_speed + delta_v, 0.0f, 45.0f);
 
 	// Slew-rate limit forward speed command matching MPC_ACC_HOR for smooth aerodynamic pitch transitions
 	const float prev_speed_cmd = _fwd_speed_cmd;
@@ -452,7 +468,7 @@ void Intercept::ComputeClosePursuitGuidance(matrix::Vector3f &vel_cmd, float &ya
 	} else {
 		lat_err = 0.0f;
 	}
-	const float vel_lat_corr = math::constrain(lat_err * kp_lat, -3.0f, 3.0f);
+	const float vel_lat_corr = math::constrain(lat_err * kp_lat, -8.0f, 8.0f);
 
 	// Unit horizontal vector perpendicular to LOS in XY plane (pointing right)
 	const float right_x = -los_y_norm;
@@ -625,7 +641,7 @@ void Intercept::Run()
 				_los_ned_valid = false;
 				_last_approach_dist = -1.f;
 				_last_approach_time = 0;
-				PX4_WARN("Visual contact lost (>1.5s), reverting to APPROACH");
+				PX4_WARN("Visual contact lost (>%.1fs), reverting to APPROACH", (double)_param_int_lost_timeout.get());
 			}
 		}
 
@@ -661,9 +677,44 @@ void Intercept::Run()
 				_last_fresh_visual_time = now;
 				_last_cmd_valid = true;
 
+			} else if (_target_pos_valid) {
+				// Target lost from camera frame:
+				// Immediately turn drone head (yaw) towards target's current position to re-acquire!
+				const float dx = _target_pos(0) - _local_pos.x;
+				const float dy = _target_pos(1) - _local_pos.y;
+				const float dist_xy = sqrtf(dx * dx + dy * dy);
+				const float desired_yaw = atan2f(dy, dx);
+				const float dt = 0.010f; // 100Hz work item step
+
+				if (_last_cmd_valid) {
+					const float max_yaw_rate = math::radians(_param_int_yaw_rate.get());
+					const float max_dyaw = max_yaw_rate * dt;
+					const float yaw_err = matrix::wrap_pi(desired_yaw - _last_yaw_cmd);
+					yaw_cmd = matrix::wrap_pi(_last_yaw_cmd + math::constrain(yaw_err, -max_dyaw, max_dyaw));
+				} else {
+					yaw_cmd = desired_yaw;
+				}
+
+				// Fly towards target position with continuous speed
+				const float pursuit_speed = math::constrain(_fwd_speed_cmd, 12.0f, 40.0f);
+				if (dist_xy > 0.5f) {
+					vel_cmd(0) = (dx / dist_xy) * pursuit_speed;
+					vel_cmd(1) = (dy / dist_xy) * pursuit_speed;
+				} else {
+					vel_cmd(0) = _last_vel_cmd(0);
+					vel_cmd(1) = _last_vel_cmd(1);
+				}
+
+				// Altitude: track target altitude
+				const float dz = _target_pos(2) - _local_pos.z;
+				vel_cmd(2) = math::constrain(dz * _param_int_kp_z.get(), -2.5f, 2.0f);
+
+				_last_vel_cmd = vel_cmd;
+				_last_yaw_cmd = yaw_cmd;
+				_last_cmd_valid = true;
+
 			} else if (_last_cmd_valid) {
-				// Intermediate 100 Hz cycle (between camera frames):
-				// Damped first-order predictive extrapolation based on command trend
+				// Coast on last known command during single-frame dropouts
 				hrt_abstime now = hrt_absolute_time();
 				float tau = (float)(now - _last_fresh_visual_time) * 1e-6f;
 				float damping = expf(-tau / 0.040f); // 40ms decay constant

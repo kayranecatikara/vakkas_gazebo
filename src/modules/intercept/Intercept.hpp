@@ -181,6 +181,8 @@ private:
 		(ParamFloat<px4::params::INT_KP_LAT>) _param_int_kp_lat,
 		(ParamFloat<px4::params::INT_KP_Z>) _param_int_kp_z,
 		(ParamFloat<px4::params::INT_KP_Z_APP>) _param_int_kp_z_app,
-		(ParamFloat<px4::params::INT_YAW_RATE>) _param_int_yaw_rate
+		(ParamFloat<px4::params::INT_YAW_RATE>) _param_int_yaw_rate,
+		(ParamFloat<px4::params::INT_K_CORNER>) _param_int_k_corner,
+		(ParamFloat<px4::params::INT_LOST_TIMEOUT>) _param_int_lost_timeout
 	)
 };
