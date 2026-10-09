@@ -24,6 +24,7 @@ import argparse
 import json
 import math
 import os
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 import re
 import threading
 import time
