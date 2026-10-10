@@ -179,6 +179,9 @@ stop_previous() {
 	for p in "${pids[@]}"; do
 		kill -9 "${p}" 2>/dev/null || true
 	done
+
+	rm -f /tmp/px4* /tmp/px4-sock-* 2>/dev/null || true
+	killall -9 px4 2>/dev/null || true
 }
 
 stop_previous
@@ -230,6 +233,7 @@ if [ "${TARGET_AUTO:-1}" != "0" ]; then
 		${PDEATH} python3 -u "${SCRIPT_DIR}/tools/web_gcs.py" --port "${WEB_GCS_PORT:-8080}" \
 			> "${SCRIPT_DIR}/build/web_gcs.log" 2>&1 &
 		echo "Web GCS:  http://localhost:${WEB_GCS_PORT:-8080} (3D Tactical Radar & C2), log: ${SCRIPT_DIR}/build/web_gcs.log"
+		( sleep 1.5; xdg-open "http://localhost:${WEB_GCS_PORT:-8080}" >/dev/null 2>&1 || true ) &
 	fi
 fi
 
