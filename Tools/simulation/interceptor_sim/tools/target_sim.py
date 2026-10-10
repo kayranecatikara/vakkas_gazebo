@@ -30,7 +30,6 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 from gz.msgs10.clock_pb2 import Clock
@@ -128,105 +127,75 @@ def square_circuit(side, heading, radius):
 # ----------------------------------------------------------------- profile ---
 
 class Profile:
-	"""Speed and altitude along the path: take-off roll, climb, cruise; continuous straight, s-turn, orbit, weave, or square."""
+	"""Speed and altitude along the path: take-off roll, climb, cruise; continuous weave, square, or dynamic maneuvers."""
 
 	def __init__(self, a):
 		self.a = a
-		self.pattern = getattr(a, "pattern", "straight")
-		if self.pattern == "weave":
-			self.mode = "s_turn"
-		else:
-			self.mode = self.pattern
-
-		self.lock = threading.Lock()
 		self.radius = a.speed ** 2 / (G * math.tan(math.radians(a.bank)))
 		self.yaw0 = math.radians(90 - a.heading)
 		self.u = np.array([math.cos(self.yaw0), math.sin(self.yaw0)])
 		self.n = np.array([-self.u[1], self.u[0]])  # left normal
 
-		self.wave_amp = getattr(a, "weave_amp", 26.0)
-		self.wave_len = getattr(a, "weave_wavelength", 550.0)
-		self.wave_phase = 0.0
-
-		if self.pattern == "square":
-			self.path = square_circuit(a.side, self.yaw0, self.radius)
-			self.lap = self.path.length
-		else:
-			self.path = None
-			self.lap = 0.0
+		self.path = square_circuit(a.side, self.yaw0, self.radius)
+		self.lap = self.path.length
+		self.wave_amp = getattr(a, "weave_amp", 30.0)
+		self.wave_len = getattr(a, "weave_wavelength", 400.0)
+		self.k_wave = 2.0 * math.pi / self.wave_len
 
 		self.s_roll = a.speed ** 2 / (2 * a.accel)
 		self.gamma = math.radians(a.climb_angle)
 		self.s_climb_end = self.s_roll + (a.alt - a.z0) / math.tan(self.gamma)
 
-		# Dynamic interactive cruise variables
+		# Dynamic scenario control state (thread-safe, updated via HTTP POST /cmd)
+		self.lock = threading.Lock()
+		self.mode = getattr(a, "pattern", "square")
+		self.pattern = self.mode
 		self.target_speed = float(a.speed)
 		self.target_alt = float(a.alt)
-		self.target_heading = float(self.yaw0)
-		self.base_heading = float(self.yaw0)
-		self.orbit_dir = 1.0  # +1 left (CCW), -1 right (CW)
-		self.orbit_bank_deg = float(getattr(a, "bank", 28.0))
+		self.manual_turn_rate = 0.0   # rad/s (+ left, - right)
+		self.manual_climb_rate = 0.0  # m/s (+ up, - down)
+		self.circle_dir = 1.0         # +1 left, -1 right
 
-		self.current_speed = 0.0
-		self.current_z = float(a.z0)
-		self.current_heading = float(self.yaw0)
-		self.current_roll = 0.0
-		self.cruise_p = None
+		# Kinematic state for dynamic maneuvers
+		self.dyn_initialized = False
+		self.p_dyn = np.array([0.0, 0.0, a.z0], dtype=float)
+		self.yaw_dyn = self.yaw0
+		self.v_dyn = a.speed
 		self.last_t = None
+		self.weave_phase = 0.0
 
-	def apply_command(self, cmd):
+	def apply_cmd(self, cmd):
 		with self.lock:
-			res = {}
 			if "mode" in cmd:
-				m = str(cmd["mode"]).lower()
-				if m in ("straight", "s_turn", "weave", "orbit", "square"):
-					self.mode = "s_turn" if m == "weave" else m
-					if self.mode == "straight":
-						self.target_heading = self.current_heading
-					elif self.mode == "s_turn":
-						self.base_heading = self.current_heading
-						self.wave_phase = 0.0
-					res["mode"] = self.mode
-
+				new_mode = str(cmd["mode"]).lower().strip()
+				if new_mode in ("square", "weave", "circle", "orbit", "straight", "dive", "climb", "manual"):
+					if new_mode == "orbit":
+						new_mode = "circle"
+					self.mode = new_mode
 			if "speed" in cmd:
-				try:
-					self.target_speed = float(np.clip(float(cmd["speed"]), 15.0, 40.0))
-					res["speed"] = self.target_speed
-				except (ValueError, TypeError):
-					pass
-
+				self.target_speed = float(np.clip(float(cmd["speed"]), 12.0, 42.0))
 			if "alt" in cmd:
-				try:
-					self.target_alt = float(np.clip(float(cmd["alt"]), 20.0, 250.0))
-					res["alt"] = self.target_alt
-				except (ValueError, TypeError):
-					pass
+				self.target_alt = float(np.clip(float(cmd["alt"]), 25.0, 300.0))
+			if "turn_rate" in cmd:
+				self.manual_turn_rate = float(np.clip(float(cmd["turn_rate"]), -0.8, 0.8))
+			if "climb_rate" in cmd:
+				self.manual_climb_rate = float(np.clip(float(cmd["climb_rate"]), -10.0, 10.0))
+			if "weave_amp" in cmd:
+				self.wave_amp = float(np.clip(float(cmd["weave_amp"]), 10.0, 80.0))
+			if "circle_dir" in cmd:
+				self.circle_dir = 1.0 if float(cmd["circle_dir"]) >= 0 else -1.0
 
-			if "nudge_alt" in cmd:
-				try:
-					val = float(cmd["nudge_alt"])
-					self.target_alt = float(np.clip(self.target_alt + val, 20.0, 250.0))
-					res["alt"] = self.target_alt
-				except (ValueError, TypeError):
-					pass
-
-			if "nudge_yaw" in cmd:
-				try:
-					# positive = left turn (increase ENU yaw), negative = right turn
-					val_deg = float(cmd["nudge_yaw"])
-					delta_rad = math.radians(val_deg)
-					self.target_heading = (self.target_heading + delta_rad + math.pi) % (2 * math.pi) - math.pi
-					self.base_heading = self.target_heading
-					res["target_heading_deg"] = round((90 - math.degrees(self.target_heading)) % 360, 1)
-				except (ValueError, TypeError):
-					pass
-
-			if "orbit_dir" in cmd:
-				self.orbit_dir = 1.0 if str(cmd["orbit_dir"]).lower() in ("left", "ccw", "1") else -1.0
-				res["orbit_dir"] = "left" if self.orbit_dir > 0 else "right"
-
-			res["current_mode"] = self.mode
-			return res
+	def get_cmd_status(self):
+		with self.lock:
+			return {
+				"mode": self.mode,
+				"target_speed": self.target_speed,
+				"target_alt": self.target_alt,
+				"manual_turn_rate": self.manual_turn_rate,
+				"manual_climb_rate": self.manual_climb_rate,
+				"weave_amp": self.wave_amp,
+				"circle_dir": self.circle_dir,
+			}
 
 	def speed_at(self, t):
 		return min(self.a.speed, self.a.accel * t)
@@ -237,128 +206,130 @@ class Profile:
 
 	def state(self, t):
 		"""position (ENU), velocity, rotation, world angular velocity"""
+		s = self.s_at(t)  # from the runway start
+		v = self.speed_at(t)
+
 		with self.lock:
-			s = self.s_at(t)
-			v = self.speed_at(t)
+			cur_mode = self.mode
+			tgt_speed = self.target_speed
+			tgt_alt = self.target_alt
+			man_turn = self.manual_turn_rate
+			man_climb = self.manual_climb_rate
+			c_dir = self.circle_dir
 
-			if s < self.s_roll:
-				# Take-off roll along runway
-				p2, yaw, kappa = s * self.u, self.yaw0, 0.0
-				z, gamma = self.a.z0, 0.0
-				roll = 0.0
-				pitch = 0.0
-				R = rot_rpy(roll, pitch, yaw)
-				vel = v * np.array([math.cos(yaw), math.sin(yaw), 0.0])
-				omega = np.zeros(3)
-				self.last_t = t
-				self.current_speed = v
-				self.current_z = z
-				return np.array([p2[0], p2[1], z]), vel, R, omega
+		# 1. Takeoff roll & climb-out: always strictly follows runway trajectory
+		if s < self.s_roll:
+			p2, yaw, kappa = s * self.u, self.yaw0, 0.0
+			z, gamma = self.a.z0, 0.0
+			R = rot_rpy(0.0, 0.0, yaw)
+			vel = v * np.array([math.cos(yaw), math.sin(yaw), 0.0])
+			omega = np.zeros(3)
+			self.last_t = t
+			return np.array([p2[0], p2[1], z]), vel, R, omega
 
-			elif s < self.s_climb_end:
-				# Initial steady climb to cruise altitude
-				p2, yaw, kappa = s * self.u, self.yaw0, 0.0
-				z = self.a.z0 + (s - self.s_roll) * math.tan(self.gamma)
-				gamma = self.gamma
-				roll = 0.0
-				pitch = -gamma
-				R = rot_rpy(roll, pitch, yaw)
-				vel = v * np.array([math.cos(gamma) * math.cos(yaw), math.cos(gamma) * math.sin(yaw), math.sin(gamma)])
-				omega = np.zeros(3)
-				self.last_t = t
-				self.current_speed = v
-				self.current_z = z
-				return np.array([p2[0], p2[1], z]), vel, R, omega
+		# 2. Default initial square circuit (until user triggers dynamic scenario)
+		if cur_mode == "square" and not self.dyn_initialized:
+			s_loop = s - self.radius
+			p2, yaw, kappa = self.path.at(s_loop % self.lap)
+			z, gamma = (tgt_alt, 0.0) if s >= self.s_climb_end else (self.a.z0 + (s - self.s_roll) * math.tan(self.gamma), self.gamma)
+			roll = -math.atan(v * v * kappa / G)
+			pitch = -gamma
+			R = rot_rpy(roll, pitch, yaw)
+			vel = v * np.array([math.cos(gamma) * math.cos(yaw), math.cos(gamma) * math.sin(yaw), math.sin(gamma)])
+			omega = np.array([0.0, 0.0, v * kappa])
+			self.last_t = t
+			return np.array([p2[0], p2[1], z]), vel, R, omega
 
-			elif self.mode == "square" and self.path is not None:
-				# Legacy square circuit
-				s_loop = s - self.radius
-				p2, yaw, kappa = self.path.at(s_loop % self.lap)
-				z, gamma = self.target_alt, 0.0
-				roll = -math.atan(v * v * kappa / G)
-				pitch = -gamma
-				R = rot_rpy(roll, pitch, yaw)
-				vel = v * np.array([math.cos(gamma) * math.cos(yaw), math.cos(gamma) * math.sin(yaw), math.sin(gamma)])
-				omega = np.array([0.0, 0.0, v * kappa])
-				self.last_t = t
-				return np.array([p2[0], p2[1], z]), vel, R, omega
+		# 3. Active Dynamic Maneuver Loop
+		dt = 0.02 if self.last_t is None else max(0.001, min(0.2, t - self.last_t))
+		self.last_t = t
 
-			else:
-				# Interactive dynamic cruise flight (straight, s_turn, orbit)
-				dt = (t - self.last_t) if self.last_t is not None else 0.02
-				if dt <= 0.0 or dt > 0.5:
-					dt = 0.02
-				self.last_t = t
+		if not self.dyn_initialized:
+			s_loop = s - self.radius
+			p2, yaw, _ = self.path.at(s_loop % self.lap)
+			z_init = tgt_alt if s >= self.s_climb_end else (self.a.z0 + (s - self.s_roll) * math.tan(self.gamma))
+			self.p_dyn = np.array([p2[0], p2[1], z_init], dtype=float)
+			self.yaw_dyn = yaw
+			self.v_dyn = v
+			self.dyn_initialized = True
 
-				if self.cruise_p is None:
-					p_end_2d = s * self.u
-					self.cruise_p = np.array([p_end_2d[0], p_end_2d[1], self.target_alt])
-					self.current_speed = v
-					self.current_z = self.target_alt
-					self.current_heading = self.yaw0
-					self.base_heading = self.yaw0
+		# Speed transition
+		acc_lim = getattr(self.a, "accel", 3.0) * dt
+		self.v_dyn += float(np.clip(tgt_speed - self.v_dyn, -acc_lim, acc_lim))
+		v_cur = self.v_dyn
 
-				# Speed progression towards target_speed
-				dv_max = 3.0 * dt
-				err_v = self.target_speed - self.current_speed
-				self.current_speed += math.copysign(min(abs(err_v), dv_max), err_v)
-				cur_v = self.current_speed
+		kappa = 0.0
+		yaw_rate = 0.0
+		climb_rate = 0.0
 
-				# Altitude progression towards target_alt
-				err_z = self.target_alt - self.current_z
-				vz = float(np.clip(1.2 * err_z, -3.5, 4.5))
-				self.current_z += vz * dt
-				gamma = math.atan2(vz, max(cur_v, 1.0))
+		if cur_mode == "square":
+			s_loop = s - self.radius
+			p2, yaw_sq, kappa_sq = self.path.at(s_loop % self.lap)
+			self.p_dyn[0] += 0.04 * (p2[0] - self.p_dyn[0])
+			self.p_dyn[1] += 0.04 * (p2[1] - self.p_dyn[1])
+			self.yaw_dyn = yaw_sq
+			yaw_rate = v_cur * kappa_sq
+			alt_err = tgt_alt - self.p_dyn[2]
+			climb_rate = float(np.clip(alt_err * 0.5, -4.0, 4.0))
 
-				# Heading and roll kinematics based on mode
-				if self.mode == "straight":
-					err_psi = (self.target_heading - self.current_heading + math.pi) % (2 * math.pi) - math.pi
-					max_turn = math.radians(20.0)
-					r_cmd = float(np.clip(1.8 * err_psi, -max_turn, max_turn))
-					self.current_heading = (self.current_heading + r_cmd * dt + math.pi) % (2 * math.pi) - math.pi
-					target_roll = -math.atan(cur_v * r_cmd / G)
-					self.current_roll += (target_roll - self.current_roll) * min(1.0, 6.0 * dt)
-					omega = np.array([0.0, 0.0, r_cmd])
+		elif cur_mode == "weave":
+			# Sinusoidal evasive S-turns
+			self.weave_phase += 2.0 * math.pi * 0.15 * dt
+			amp_rad = math.radians(26.0)
+			yaw_rate = amp_rad * (2.0 * math.pi * 0.15) * math.cos(self.weave_phase)
+			kappa = yaw_rate / max(v_cur, 1.0)
+			alt_err = tgt_alt - self.p_dyn[2]
+			climb_rate = float(np.clip(alt_err * 0.5, -4.0, 4.0))
 
-				elif self.mode == "s_turn":
-					self.wave_phase += (2.0 * math.pi * cur_v / self.wave_len) * dt
-					k_wave = 2.0 * math.pi / self.wave_len
-					dy_ds = self.wave_amp * k_wave * math.cos(self.wave_phase)
-					d2y_ds2 = -self.wave_amp * (k_wave ** 2) * math.sin(self.wave_phase)
-					psi_offset = math.atan(dy_ds)
-					self.current_heading = (self.base_heading + psi_offset + math.pi) % (2 * math.pi) - math.pi
-					kappa = d2y_ds2 / ((1.0 + dy_ds ** 2) ** 1.5)
-					r_cmd = cur_v * kappa
-					target_roll = -math.atan(cur_v * cur_v * kappa / G)
-					self.current_roll += (target_roll - self.current_roll) * min(1.0, 6.0 * dt)
-					omega = np.array([0.0, 0.0, r_cmd])
+		elif cur_mode == "circle":
+			# Continuous coordinated turn orbit
+			bank_rad = math.radians(getattr(self.a, "bank", 22.0))
+			yaw_rate = c_dir * (G * math.tan(bank_rad)) / max(v_cur, 1.0)
+			kappa = yaw_rate / max(v_cur, 1.0)
+			alt_err = tgt_alt - self.p_dyn[2]
+			climb_rate = float(np.clip(alt_err * 0.5, -4.0, 4.0))
 
-				elif self.mode == "orbit":
-					bank_rad = math.radians(self.orbit_bank_deg)
-					r_cmd = self.orbit_dir * (G * math.tan(bank_rad) / max(cur_v, 1.0))
-					self.current_heading = (self.current_heading + r_cmd * dt + math.pi) % (2 * math.pi) - math.pi
-					self.target_heading = self.current_heading
-					self.base_heading = self.current_heading
-					target_roll = -self.orbit_dir * bank_rad
-					self.current_roll += (target_roll - self.current_roll) * min(1.0, 6.0 * dt)
-					omega = np.array([0.0, 0.0, r_cmd])
+		elif cur_mode == "straight":
+			yaw_rate = 0.0
+			kappa = 0.0
+			alt_err = tgt_alt - self.p_dyn[2]
+			climb_rate = float(np.clip(alt_err * 0.5, -4.0, 4.0))
 
-				else:
-					omega = np.zeros(3)
+		elif cur_mode == "dive":
+			yaw_rate = 0.0
+			kappa = 0.0
+			dive_target = min(tgt_alt, 35.0)
+			alt_err = dive_target - self.p_dyn[2]
+			climb_rate = float(np.clip(alt_err * 0.8, -7.0, 0.0))
 
-				# Position progression
-				dx = cur_v * math.cos(gamma) * math.cos(self.current_heading) * dt
-				dy = cur_v * math.cos(gamma) * math.sin(self.current_heading) * dt
-				self.cruise_p[0] += dx
-				self.cruise_p[1] += dy
-				self.cruise_p[2] = self.current_z
+		elif cur_mode == "climb":
+			yaw_rate = 0.0
+			kappa = 0.0
+			climb_target = max(tgt_alt, 150.0)
+			alt_err = climb_target - self.p_dyn[2]
+			climb_rate = float(np.clip(alt_err * 0.8, 0.0, 7.0))
 
-				roll = self.current_roll
-				pitch = -gamma
-				yaw = self.current_heading
-				R = rot_rpy(roll, pitch, yaw)
-				vel = cur_v * np.array([math.cos(gamma) * math.cos(yaw), math.cos(gamma) * math.sin(yaw), math.sin(gamma)])
-				return self.cruise_p.copy(), vel, R, omega
+		elif cur_mode == "manual":
+			yaw_rate = man_turn
+			kappa = yaw_rate / max(v_cur, 1.0)
+			climb_rate = man_climb
+
+		# Step kinematic integration
+		self.yaw_dyn += yaw_rate * dt
+		gamma = math.atan2(climb_rate, max(v_cur, 1.0))
+		h_speed = v_cur * math.cos(gamma)
+
+		self.p_dyn[0] += h_speed * math.cos(self.yaw_dyn) * dt
+		self.p_dyn[1] += h_speed * math.sin(self.yaw_dyn) * dt
+		self.p_dyn[2] = max(10.0, self.p_dyn[2] + climb_rate * dt)
+
+		roll = -math.atan(v_cur * v_cur * kappa / G)
+		pitch = -gamma
+		R = rot_rpy(roll, pitch, self.yaw_dyn)
+		vel = np.array([h_speed * math.cos(self.yaw_dyn), h_speed * math.sin(self.yaw_dyn), climb_rate])
+		omega = np.array([0.0, 0.0, yaw_rate])
+
+		return np.copy(self.p_dyn), vel, R, omega
 
 
 # --------------------------------------------------------------- telemetry ---
@@ -369,7 +340,7 @@ class Telemetry:
 		self.lock = threading.Lock()
 		self.data = {"valid": False}
 
-	def update(self, t_sim, p, v, R, mode="straight", target_speed=25.0, target_alt=100.0, target_heading_deg=0.0):
+	def update(self, t_sim, p, v, R, mode="square", tgt_speed=25.0, tgt_alt=100.0):
 		lat = self.lat0 + p[1] / 111132.95
 		lon = self.lon0 + p[0] / (111319.49 * math.cos(math.radians(self.lat0)))
 		heading = (90 - math.degrees(math.atan2(v[1], v[0]))) % 360 if np.hypot(v[0], v[1]) > 0.5 else \
@@ -385,6 +356,8 @@ class Telemetry:
 				"utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
 				"lat": round(lat, 8),
 				"lon": round(lon, 8),
+				"pos_east_m": round(float(p[0]), 3),
+				"pos_north_m": round(float(p[1]), 3),
 				"alt_amsl_m": round(self.alt0 + p[2], 2),
 				"alt_rel_m": round(p[2], 2),
 				"heading_deg": round(heading, 2),
@@ -392,13 +365,11 @@ class Telemetry:
 				"vn_mps": round(float(v[1]), 2),
 				"ve_mps": round(float(v[0]), 2),
 				"vd_mps": round(float(-v[2]), 2),
-				# aviation convention: roll right wing down +, pitch nose up +
 				"roll_deg": round(roll, 2),
 				"pitch_deg": round(-pitch, 2),
 				"mode": mode,
-				"target_speed": round(float(target_speed), 1),
-				"target_alt": round(float(target_alt), 1),
-				"target_heading_deg": round(float(target_heading_deg), 1),
+				"target_speed": round(tgt_speed, 1),
+				"target_alt": round(tgt_alt, 1),
 			}
 
 	def snapshot(self):
@@ -408,48 +379,39 @@ class Telemetry:
 
 def serve_http(telemetry, profile, port):
 	class Handler(BaseHTTPRequestHandler):
-		def _send_json(self, data, code=200):
-			body = json.dumps(data).encode()
-			self.send_response(code)
+		def do_GET(self):
+			if self.path.split("?")[0] not in ("/", "/target"):
+				self.send_error(404)
+				return
+
+			body = json.dumps(telemetry.snapshot()).encode()
+			self.send_response(200)
 			self.send_header("Content-Type", "application/json")
 			self.send_header("Access-Control-Allow-Origin", "*")
-			self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			self.send_header("Access-Control-Allow-Headers", "Content-Type")
 			self.send_header("Content-Length", str(len(body)))
 			self.end_headers()
 			self.wfile.write(body)
 
-		def do_OPTIONS(self):
-			self.send_response(200)
-			self.send_header("Access-Control-Allow-Origin", "*")
-			self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			self.send_header("Access-Control-Allow-Headers", "Content-Type")
-			self.end_headers()
-
-		def do_GET(self):
-			parsed = urlparse(self.path)
-			path = parsed.path
-			if path in ("/", "/target"):
-				self._send_json(telemetry.snapshot())
-			elif path == "/cmd":
-				query = parse_qs(parsed.query)
-				cmd = {k: v[0] for k, v in query.items()}
-				res = profile.apply_command(cmd)
-				self._send_json({"status": "ok", "result": res})
-			else:
-				self.send_error(404)
-
 		def do_POST(self):
-			parsed = urlparse(self.path)
-			if parsed.path == "/cmd":
-				length = int(self.headers.get("Content-Length", 0))
-				raw = self.rfile.read(length) if length > 0 else b"{}"
+			if self.path.split("?")[0] in ("/cmd", "/control", "/mode"):
 				try:
-					cmd = json.loads(raw.decode("utf-8")) if raw else {}
-				except Exception:
-					cmd = {}
-				res = profile.apply_command(cmd)
-				self._send_json({"status": "ok", "result": res})
+					length = int(self.headers.get("Content-Length", 0))
+					data = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+					profile.apply_cmd(data)
+					resp = json.dumps({"status": "ok", "applied": profile.get_cmd_status()}).encode("utf-8")
+					self.send_response(200)
+					self.send_header("Content-Type", "application/json")
+					self.send_header("Access-Control-Allow-Origin", "*")
+					self.send_header("Content-Length", str(len(resp)))
+					self.end_headers()
+					self.wfile.write(resp)
+				except Exception as e:
+					err_msg = json.dumps({"status": "error", "message": str(e)}).encode("utf-8")
+					self.send_response(400)
+					self.send_header("Content-Type", "application/json")
+					self.send_header("Content-Length", str(len(err_msg)))
+					self.end_headers()
+					self.wfile.write(err_msg)
 			else:
 				self.send_error(404)
 
@@ -483,8 +445,8 @@ def main():
 	ap.add_argument("--accel", type=float, default=4.0, help="take-off acceleration [m/s^2]")
 	ap.add_argument("--climb-angle", type=float, default=8.0, help="[deg]")
 	ap.add_argument("--heading", type=float, default=None, help="first side [deg true], default: runway")
-	ap.add_argument("--pattern", choices=["straight", "weave", "orbit", "square"], default="straight",
-			help="flight path pattern: 'straight', 'weave' (S-turns), 'orbit' (circle), or 'square' (square circuit)")
+	ap.add_argument("--pattern", choices=["weave", "square"], default="weave",
+			help="flight path pattern: 'weave' (continuous serpentine S-turns) or 'square' (square circuit)")
 	ap.add_argument("--weave-amp", type=float, default=26.0, help="lateral weave amplitude [m] (controls bank angle)")
 	ap.add_argument("--weave-wavelength", type=float, default=550.0, help="weave cycle wavelength [m]")
 	ap.add_argument("--rate", type=float, default=2.0, help="telemetry rate [Hz]")
@@ -524,13 +486,9 @@ def main():
 	if profile.pattern == "square":
 		print(f"target: {a.side:.0f} m square, {a.alt:.0f} m, {a.speed:.0f} m/s, turn radius {profile.radius:.0f} m, "
 		      f"lap {profile.lap:.0f} m; HTTP :{a.http_port}/target, ADS-B {a.adsb or 'off'}", flush=True)
-	elif profile.pattern == "weave":
+	else:
 		print(f"target: continuous weave (amp {profile.wave_amp:.1f} m, cycle {profile.wave_len:.0f} m, ~12 deg bank), "
 		      f"{a.alt:.0f} m, {a.speed:.0f} m/s; HTTP :{a.http_port}/target, ADS-B {a.adsb or 'off'}", flush=True)
-	elif profile.pattern == "orbit":
-		print(f"target: orbit circle, {a.alt:.0f} m, {a.speed:.0f} m/s; HTTP :{a.http_port}/target, ADS-B {a.adsb or 'off'}", flush=True)
-	else:
-		print(f"target: straight flight (interactive mode enabled), {a.alt:.0f} m, {a.speed:.0f} m/s; HTTP :{a.http_port}/target, ADS-B {a.adsb or 'off'}", flush=True)
 
 	while "pose" not in state or "t" not in state:
 		time.sleep(0.1)
@@ -558,9 +516,7 @@ def main():
 		if t_sim - last_tel >= 1.0 / a.rate:
 			v = (p - prev[1]) / (t_sim - prev[0]) if prev and t_sim > prev[0] else v_d
 			prev = (t_sim, p)
-			target_hdg_deg = (90 - math.degrees(profile.target_heading)) % 360
-			telemetry.update(t_sim, p, v, R, mode=profile.mode, target_speed=profile.target_speed,
-					 target_alt=profile.target_alt, target_heading_deg=target_hdg_deg)
+			telemetry.update(t_sim, p, v, R, mode=profile.mode, tgt_speed=profile.target_speed, tgt_alt=profile.target_alt)
 			last_tel = t_sim
 
 			if adsb:
@@ -569,7 +525,7 @@ def main():
 		if t_sim - last_print >= 10:
 			d = telemetry.snapshot()
 			if d["valid"]:
-				print(f"t={t:6.0f}s  mode={d.get('mode', 'unk')}  alt {d['alt_rel_m']:6.1f} m  speed {d['ground_speed_mps']:5.1f} m/s  "
+				print(f"t={t:6.0f}s  alt {d['alt_rel_m']:6.1f} m  speed {d['ground_speed_mps']:5.1f} m/s  "
 				      f"heading {d['heading_deg']:5.1f}  pos error {np.linalg.norm(p_d - p):5.2f} m", flush=True)
 			last_print = t_sim
 
