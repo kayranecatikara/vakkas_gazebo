@@ -75,8 +75,8 @@ history_times = deque(maxlen=200)
 history_dist = deque(maxlen=200)
 history_v_int = deque(maxlen=200)
 history_v_tgt = deque(maxlen=200)
-int_trail = deque(maxlen=300)
-tgt_trail = deque(maxlen=300)
+int_trail = deque(maxlen=1000)
+tgt_trail = deque(maxlen=1000)
 
 # ---------------------------------------------------- Gazebo Transport Worker ---
 
@@ -136,7 +136,7 @@ def gz_transport_worker_thread(world="ankara", interceptor_name="interceptor_0",
                     inter["speed"] = round(spd, 2)
                     inter["alt"] = round(pos.z, 2)
                     inter["att"] = [round(roll, 1), round(pitch, 1), round(yaw, 1)]
-                    int_trail.append([round(pos.x, 2), round(pos.y, 2)])
+                    int_trail.append([round(pos.x, 2), round(pos.y, 2), round(pos.z, 2)])
 
     topic = f"/world/{world}/dynamic_pose/info"
     node.subscribe(Pose_V, topic, on_pose)
@@ -180,7 +180,7 @@ def mavlink_worker_thread(primary_port=14545, fallback_ports=(14540, 14550, 1455
                     inter["vel"] = [round(msg.vx, 3), round(msg.vy, 3), round(msg.vz, 3)]
                     inter["speed"] = round(float(np.hypot(msg.vx, msg.vy)), 2)
                     inter["alt"] = round(-msg.z, 2)
-                    int_trail.append([round(msg.y, 2), round(msg.x, 2)])
+                    int_trail.append([round(msg.y, 2), round(msg.x, 2), round(-msg.z, 2)])
 
                 elif mtype == "ATTITUDE":
                     inter["att"] = [
@@ -266,7 +266,7 @@ def target_poller_thread(http_port=8000, rate=20.0):
                                 round(d.get("pitch_deg", 0.0), 1),
                                 round(d.get("heading_deg", 0.0), 1)
                             ]
-                            tgt_trail.append([round(de, 2), round(dn, 2)])
+                            tgt_trail.append([round(de, 2), round(dn, 2), round(alt, 2)])
         except Exception:
             with state_lock:
                 telemetry_data["talon"]["connected"] = False
@@ -572,66 +572,115 @@ HTML_CONTENT = """<!DOCTYPE html>
         </div>
       </div>
 
-      <!-- Manual Steering Pad -->
-      <div class="card-glass rounded-lg p-3.5">
-        <h3 class="text-sm font-bold text-slate-300 uppercase tracking-wide mb-2.5"><i class="fa-solid fa-gamepad text-xs mr-2"></i>Manuel Dümen Masası (Bas-Tut)</h3>
+      <!-- Virtual Joystick Control Deck -->
+      <div class="card-glass rounded-lg p-3.5 border-l-4 border-amber-500">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-sm font-bold text-slate-300 uppercase tracking-wide"><i class="fa-solid fa-gamepad text-xs mr-2 text-amber-400"></i>Talon Sanal Joystick</h3>
+          <span id="joy-status-badge" class="mono text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded border border-slate-700">MERKEZDE</span>
+        </div>
         
-        <div class="grid grid-cols-3 gap-1.5 text-xs font-bold text-center">
-          <div></div>
-          <button onmousedown="sendManualClimb(4)" onmouseup="sendManualClimb(0)" class="bg-slate-800 hover:bg-cyan-900 border border-slate-700 hover:border-cyan-400 p-2 rounded transition active:scale-95">
-            <i class="fa-solid fa-arrow-up"></i><div class="text-[10px] mt-0.5">TIRMAN</div>
-          </button>
-          <div></div>
+        <div class="flex flex-col items-center">
+          <!-- Joystick Base Container -->
+          <div class="relative w-44 h-44 my-1 select-none flex items-center justify-center">
+            <!-- Background Ring & Reticle -->
+            <div id="joy-base" class="w-40 h-40 rounded-full bg-slate-950/90 border-2 border-slate-700/80 relative overflow-hidden shadow-[inset_0_0_20px_rgba(0,0,0,0.8)] cursor-grab active:cursor-grabbing">
+              <!-- Radial Grid Lines -->
+              <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <div class="w-full h-[1px] bg-slate-800"></div>
+                <div class="h-full w-[1px] bg-slate-800 absolute"></div>
+                <div class="w-24 h-24 rounded-full border border-slate-800/80 absolute"></div>
+                <div class="w-12 h-12 rounded-full border border-dashed border-slate-700/60 absolute"></div>
+                <!-- Direction Labels -->
+                <span class="absolute top-1 text-[9px] mono text-slate-500 font-bold">TIRMAN</span>
+                <span class="absolute bottom-1 text-[9px] mono text-slate-500 font-bold">DAL</span>
+                <span class="absolute left-1.5 text-[9px] mono text-slate-500 font-bold">SOL</span>
+                <span class="absolute right-1.5 text-[9px] mono text-slate-500 font-bold">SAĞ</span>
+              </div>
+              
+              <!-- Draggable Knob -->
+              <div id="joy-knob" class="absolute w-12 h-12 rounded-full bg-gradient-to-br from-red-500 to-amber-600 border-2 border-white/80 shadow-[0_0_15px_rgba(239,68,68,0.7)] flex items-center justify-center pointer-events-none transform -translate-x-1/2 -translate-y-1/2" style="left: 80px; top: 80px;">
+                <div class="w-4 h-4 rounded-full bg-white/90 shadow-inner"></div>
+              </div>
+            </div>
+          </div>
 
-          <button onmousedown="sendManualTurn(0.4)" onmouseup="sendManualTurn(0)" class="bg-slate-800 hover:bg-cyan-900 border border-slate-700 hover:border-cyan-400 p-2 rounded transition active:scale-95">
-            <i class="fa-solid fa-arrow-left"></i><div class="text-[10px] mt-0.5">SOLA DÖN</div>
-          </button>
-          <button onclick="setTalonMode('straight')" class="bg-slate-800 hover:bg-slate-700 border border-slate-600 p-2 rounded transition text-[11px] flex flex-col items-center justify-center">
-            <i class="fa-solid fa-circle-dot text-amber-400 mb-0.5"></i>DÜZELT
-          </button>
-          <button onmousedown="sendManualTurn(-0.4)" onmouseup="sendManualTurn(0)" class="bg-slate-800 hover:bg-cyan-900 border border-slate-700 hover:border-cyan-400 p-2 rounded transition active:scale-95">
-            <i class="fa-solid fa-arrow-right"></i><div class="text-[10px] mt-0.5">SAĞA DÖN</div>
-          </button>
+          <!-- Axis Values -->
+          <div class="w-full grid grid-cols-2 gap-2 text-xs mono mt-1">
+            <div class="bg-slate-900/80 p-1.5 rounded border border-slate-800 text-center">
+              <span class="text-[10px] text-slate-400 block">DÖNÜŞ ORANI</span>
+              <span id="joy-turn-val" class="font-bold text-amber-400">0.00 rad/s</span>
+            </div>
+            <div class="bg-slate-900/80 p-1.5 rounded border border-slate-800 text-center">
+              <span class="text-[10px] text-slate-400 block">TIRMANIŞ</span>
+              <span id="joy-climb-val" class="font-bold text-cyan-400">0.0 m/s</span>
+            </div>
+          </div>
 
-          <div></div>
-          <button onmousedown="sendManualClimb(-4)" onmouseup="sendManualClimb(0)" class="bg-slate-800 hover:bg-cyan-900 border border-slate-700 hover:border-cyan-400 p-2 rounded transition active:scale-95">
-            <i class="fa-solid fa-arrow-down"></i><div class="text-[10px] mt-0.5">DAL</div>
+          <button onclick="resetTalonJoystick()" class="w-full mt-2.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 text-xs py-1.5 rounded font-semibold transition active:scale-95 flex items-center justify-center space-x-1.5">
+            <i class="fa-solid fa-arrows-to-dot text-amber-400"></i><span>DÜZELT & SEVİYELE</span>
           </button>
-          <div></div>
         </div>
       </div>
 
     </div>
 
-    <!-- CENTER COLUMN: 2D TACTICAL RADAR (6 Cols) -->
+    <!-- CENTER COLUMN: INTERACTIVE 3D/ORTHOGONAL RADAR (6 Cols) -->
     <div class="col-span-12 lg:col-span-6 card-glass rounded-lg p-3.5 flex flex-col">
-      <div class="flex items-center justify-between mb-2">
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
         <div class="flex items-center space-x-2">
-          <span class="w-3 h-3 rounded-full bg-cyan-400 animate-pulse"></span>
-          <h2 class="text-base font-bold text-cyan-400 tracking-wider uppercase">2D TAKTİK RADAR & KUŞBAKIŞI YÖRÜNGE HARİTASI</h2>
+          <span class="w-3 h-3 rounded-full bg-emerald-400 animate-pulse"></span>
+          <h2 class="text-base font-bold text-cyan-400 tracking-wider uppercase">3B İNTERAKTİF TAKTİK RADAR</h2>
         </div>
-        <div class="flex items-center space-x-2 text-xs mono">
-          <span class="text-slate-400">Ölçek:</span>
-          <button onclick="zoomRadar(1.2)" class="bg-slate-800 border border-slate-600 px-2 py-0.5 rounded hover:bg-slate-700">+</button>
-          <button onclick="zoomRadar(0.8)" class="bg-slate-800 border border-slate-600 px-2 py-0.5 rounded hover:bg-slate-700">-</button>
-          <button onclick="resetRadarZoom()" class="bg-slate-800 border border-slate-600 px-2 py-0.5 rounded hover:bg-slate-700">SIFIRLA</button>
+        
+        <!-- View Mode & Control Buttons -->
+        <div class="flex flex-wrap items-center gap-1.5 text-xs mono">
+          <!-- View Modes -->
+          <div class="bg-slate-900 p-0.5 rounded border border-slate-700 flex space-x-1">
+            <button id="btn-mode-xy" onclick="setRadarMode('xy')" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-cyan-900 text-slate-300 border border-transparent transition">XY (ÜST)</button>
+            <button id="btn-mode-xz" onclick="setRadarMode('xz')" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-cyan-900 text-slate-300 border border-transparent transition">XZ (YAN)</button>
+            <button id="btn-mode-yz" onclick="setRadarMode('yz')" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-cyan-900 text-slate-300 border border-transparent transition">YZ (ÖN)</button>
+            <button id="btn-mode-3d" onclick="setRadarMode('3d')" class="px-2 py-0.5 rounded bg-cyan-600 text-white font-bold border border-cyan-400 shadow transition">3B (SERBEST)</button>
+          </div>
+
+          <!-- Zoom & Reset -->
+          <button onclick="zoomRadar(1.2)" title="Yakınlaş" class="bg-slate-800 border border-slate-600 px-2 py-0.5 rounded hover:bg-slate-700 text-slate-200 font-bold">+</button>
+          <button onclick="zoomRadar(0.8)" title="Uzaklaş" class="bg-slate-800 border border-slate-600 px-2 py-0.5 rounded hover:bg-slate-700 text-slate-200 font-bold">-</button>
+          <button onclick="focusRadarVehicles()" title="Araçları Ortala" class="bg-slate-800 border border-slate-600 px-2 py-0.5 rounded hover:bg-slate-700 text-cyan-400">ORTALA</button>
+          <button onclick="resetRadarView()" title="Görünümü Sıfırla" class="bg-slate-800 border border-slate-600 px-2 py-0.5 rounded hover:bg-slate-700 text-amber-400">SIFIRLA</button>
         </div>
       </div>
 
       <!-- Radar Canvas Container -->
-      <div class="relative flex-1 w-full bg-[#080d14] rounded-lg border border-cyan-900/60 overflow-hidden min-h-[380px] flex items-center justify-center">
-        <canvas id="radarCanvas" class="w-full h-full"></canvas>
+      <div class="relative flex-1 w-full bg-[#070b12] rounded-lg border border-cyan-900/60 overflow-hidden min-h-[400px] flex items-center justify-center">
+        <canvas id="radarCanvas" class="w-full h-full cursor-grab active:cursor-grabbing"></canvas>
         
         <!-- Legend Overlay -->
-        <div class="absolute bottom-2 left-2 bg-slate-950/80 p-2 rounded border border-slate-800 text-[11px] mono space-y-1">
-          <div class="flex items-center space-x-2"><span class="w-2.5 h-2.5 rounded bg-red-500 inline-block"></span><span class="text-slate-300">Talon 1718 (Hedef)</span></div>
-          <div class="flex items-center space-x-2"><span class="w-2.5 h-2.5 rounded bg-cyan-400 inline-block"></span><span class="text-slate-300">Octopus 100 (Önleyici)</span></div>
-          <div class="flex items-center space-x-2"><span class="w-2.5 h-2.5 border border-dashed border-emerald-400 inline-block"></span><span class="text-slate-300">5 Metre Ağ Yakalama Halkası</span></div>
-          <div class="flex items-center space-x-2"><span class="w-3 h-0.5 bg-amber-400 inline-block"></span><span class="text-slate-300">Görüş Hattı (LOS)</span></div>
+        <div class="absolute bottom-2 left-2 bg-slate-950/85 p-2 rounded border border-slate-800 text-[11px] mono space-y-1 backdrop-blur-sm pointer-events-none">
+          <div class="flex items-center space-x-2">
+            <span class="w-2.5 h-2.5 rounded-full bg-[#00ff66] shadow-[0_0_8px_#00ff66] inline-block"></span>
+            <span class="text-slate-200 font-semibold">Octopus 100 (Önleyici)</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <span class="w-2.5 h-2.5 rounded-full bg-[#ff3344] shadow-[0_0_8px_#ff3344] inline-block"></span>
+            <span class="text-slate-200 font-semibold">Talon 1718 (Hedef)</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <span class="w-2.5 h-2.5 border border-dashed border-emerald-400 inline-block"></span>
+            <span class="text-slate-400">5 Metre Ağ Yakalama Halkası</span>
+          </div>
+          <div class="flex items-center space-x-2">
+            <span class="w-3 h-0.5 bg-amber-400 inline-block"></span>
+            <span class="text-slate-400">Görüş Hattı (LOS)</span>
+          </div>
         </div>
 
-        <div id="radar-fps-badge" class="absolute top-2 right-2 mono text-xs bg-slate-900/80 px-2 py-1 rounded border border-slate-700 text-cyan-400">
-          60 FPS RADAR
+        <!-- Mode & Hint Overlay -->
+        <div class="absolute top-2 left-2 mono text-[10px] text-slate-400 bg-slate-950/70 px-2 py-1 rounded border border-slate-800/80 pointer-events-none">
+          <span id="radar-help-hint">3B Serbest: Sol Tık: Döndür | Sağ Tık/Shift: Kaydır | Tekerlek: Zoom</span>
+        </div>
+
+        <div id="radar-fps-badge" class="absolute top-2 right-2 mono text-xs bg-slate-900/80 px-2 py-1 rounded border border-slate-700 text-cyan-400 pointer-events-none">
+          60 FPS 3B
         </div>
       </div>
     </div>
@@ -893,6 +942,143 @@ HTML_CONTENT = """<!DOCTYPE html>
       });
     }
 
+    // --- Talon Virtual Joystick Engine ---
+    let joyActive = false;
+    let joyTurnRate = 0.0;
+    let joyClimbRate = 0.0;
+    let joySendTimer = null;
+    const joyBase = document.getElementById("joy-base");
+    const joyKnob = document.getElementById("joy-knob");
+    const joyStatus = document.getElementById("joy-status-badge");
+    const joyTurnVal = document.getElementById("joy-turn-val");
+    const joyClimbVal = document.getElementById("joy-climb-val");
+
+    const JOY_RADIUS = 52.0;
+    const JOY_CENTER_X = 80.0;
+    const JOY_CENTER_Y = 80.0;
+
+    function updateJoystickVisual(x, y) {
+      if (joyKnob) {
+        joyKnob.style.left = `${x}px`;
+        joyKnob.style.top = `${y}px`;
+      }
+    }
+
+    function sendJoystickCommand() {
+      if (!joyActive) return;
+      fetch("/api/talon/cmd", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode: "manual",
+          turn_rate: joyTurnRate,
+          climb_rate: joyClimbRate
+        })
+      }).catch(() => {});
+    }
+
+    function onJoystickPointerDown(e) {
+      joyActive = true;
+      try { joyBase.setPointerCapture(e.pointerId); } catch(err) {}
+      joyStatus.innerText = "MANUEL DÜMEN";
+      joyStatus.className = "mono text-[10px] bg-amber-900/80 text-amber-300 px-2 py-0.5 rounded border border-amber-600";
+      onJoystickPointerMove(e);
+      if (!joySendTimer) {
+        joySendTimer = setInterval(sendJoystickCommand, 60);
+      }
+    }
+
+    function onJoystickPointerMove(e) {
+      if (!joyActive) return;
+      const rect = joyBase.getBoundingClientRect();
+      const pointerX = e.clientX - rect.left;
+      const pointerY = e.clientY - rect.top;
+
+      let dx = pointerX - JOY_CENTER_X;
+      let dy = pointerY - JOY_CENTER_Y;
+      const dist = Math.hypot(dx, dy);
+
+      if (dist > JOY_RADIUS) {
+        dx = (dx / dist) * JOY_RADIUS;
+        dy = (dy / dist) * JOY_RADIUS;
+      }
+
+      updateJoystickVisual(JOY_CENTER_X + dx, JOY_CENTER_Y + dy);
+
+      let nx = dx / JOY_RADIUS;
+      let ny = -dy / JOY_RADIUS;
+
+      if (Math.hypot(nx, ny) < 0.08) {
+        nx = 0.0;
+        ny = 0.0;
+      }
+
+      // Left turns Talon left (+turn_rate), right turns right (-turn_rate)
+      joyTurnRate = parseFloat((-nx * 0.60).toFixed(2));
+      // Up climbs (+climb_rate), down dives (-climb_rate)
+      joyClimbRate = parseFloat((ny * 6.0).toFixed(1));
+
+      joyTurnVal.innerText = `${joyTurnRate > 0 ? '+' : ''}${joyTurnRate.toFixed(2)} rad/s`;
+      joyClimbVal.innerText = `${joyClimbRate > 0 ? '+' : ''}${joyClimbRate.toFixed(1)} m/s`;
+    }
+
+    function onJoystickPointerUp(e) {
+      if (!joyActive) return;
+      joyActive = false;
+      try { joyBase.releasePointerCapture(e.pointerId); } catch(err) {}
+
+      if (joySendTimer) {
+        clearInterval(joySendTimer);
+        joySendTimer = null;
+      }
+
+      // Spring return to center
+      joyKnob.style.transition = "all 0.15s ease-out";
+      updateJoystickVisual(JOY_CENTER_X, JOY_CENTER_Y);
+      setTimeout(() => { if (joyKnob) joyKnob.style.transition = "none"; }, 160);
+
+      joyTurnRate = 0.0;
+      joyClimbRate = 0.0;
+      joyTurnVal.innerText = "0.00 rad/s";
+      joyClimbVal.innerText = "0.0 m/s";
+
+      joyStatus.innerText = "MERKEZDE";
+      joyStatus.className = "mono text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded border border-slate-700";
+
+      fetch("/api/talon/cmd", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "manual", turn_rate: 0.0, climb_rate: 0.0 })
+      }).catch(() => {});
+    }
+
+    if (joyBase) {
+      joyBase.addEventListener("pointerdown", onJoystickPointerDown);
+      joyBase.addEventListener("pointermove", onJoystickPointerMove);
+      joyBase.addEventListener("pointerup", onJoystickPointerUp);
+      joyBase.addEventListener("pointercancel", onJoystickPointerUp);
+    }
+
+    function resetTalonJoystick() {
+      joyActive = false;
+      if (joySendTimer) {
+        clearInterval(joySendTimer);
+        joySendTimer = null;
+      }
+      updateJoystickVisual(JOY_CENTER_X, JOY_CENTER_Y);
+      joyTurnRate = 0.0;
+      joyClimbRate = 0.0;
+      joyTurnVal.innerText = "0.00 rad/s";
+      joyClimbVal.innerText = "0.0 m/s";
+      joyStatus.innerText = "DÜZ UÇUŞ";
+      joyStatus.className = "mono text-[10px] bg-emerald-900/80 text-emerald-300 px-2 py-0.5 rounded border border-emerald-600";
+      fetch("/api/talon/cmd", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "straight", turn_rate: 0.0, climb_rate: 0.0 })
+      });
+    }
+
     function sendManualTurn(rate) {
       fetch("/api/talon/cmd", {
         method: "POST",
@@ -925,64 +1111,324 @@ HTML_CONTENT = """<!DOCTYPE html>
       fetch("/api/tools/qgc", {method: "POST"});
     }
 
-    // --- 2D Tactical Radar Canvas ---
+    // --- 3D & Orthogonal Tactical Radar Canvas ---
     const canvas = document.getElementById("radarCanvas");
     const ctx = canvas.getContext("2d");
 
+    let radarMode = "3d"; // '3d', 'xy', 'xz', 'yz'
+    let radarZoom = 1.0;
+    let panX = 0.0;
+    let panY = 0.0;
+    let rotX = 0.58;  // Pitch angle (~33 deg)
+    let rotY = -0.65; // Yaw angle (~-37 deg)
+    let isDragging = false;
+    let dragMode = "orbit"; // "orbit" or "pan"
+    let lastMouseX = 0;
+    let lastMouseY = 0;
+
     function resizeCanvas() {
-      canvas.width = canvas.parentElement.clientWidth;
-      canvas.height = canvas.parentElement.clientHeight;
+      if (canvas && canvas.parentElement) {
+        canvas.width = canvas.parentElement.clientWidth;
+        canvas.height = canvas.parentElement.clientHeight;
+      }
     }
     window.addEventListener("resize", resizeCanvas);
     resizeCanvas();
 
-    function zoomRadar(factor) {
-      radarZoom *= factor;
-      radarZoom = Math.max(0.2, Math.min(5.0, radarZoom));
-    }
-    function resetRadarZoom() {
-      radarZoom = 1.0;
+    function setRadarMode(mode) {
+      radarMode = mode;
+      ["xy", "xz", "yz", "3d"].forEach(m => {
+        const btn = document.getElementById(`btn-mode-${m}`);
+        if (!btn) return;
+        if (m === mode) {
+          btn.className = "px-2 py-0.5 rounded bg-cyan-600 text-white font-bold border border-cyan-400 shadow transition";
+        } else {
+          btn.className = "px-2 py-0.5 rounded bg-slate-800 hover:bg-cyan-900 text-slate-300 border border-transparent transition";
+        }
+      });
+
+      const hintEl = document.getElementById("radar-help-hint");
+      if (hintEl) {
+        if (mode === "3d") {
+          hintEl.innerText = "3B Serbest: Sol Tık: Döndür | Sağ Tık/Shift: Kaydır | Tekerlek: Zoom";
+        } else if (mode === "xy") {
+          hintEl.innerText = "XY (Kuşbakışı): Sol Tık: Kaydır (Doğu-Kuzey) | Tekerlek: Zoom";
+        } else if (mode === "xz") {
+          hintEl.innerText = "XZ (Yan Profil): Sol Tık: Kaydır (Doğu-İrtifa) | Tekerlek: Zoom";
+        } else if (mode === "yz") {
+          hintEl.innerText = "YZ (Ön Profil): Sol Tık: Kaydır (Kuzey-İrtifa) | Tekerlek: Zoom";
+        }
+      }
     }
 
+    function zoomRadar(factor) {
+      radarZoom *= factor;
+      radarZoom = Math.max(0.15, Math.min(10.0, radarZoom));
+    }
+
+    function resetRadarView() {
+      radarZoom = 1.0;
+      panX = 0.0;
+      panY = 0.0;
+      rotX = 0.58;
+      rotY = -0.65;
+    }
+
+    function focusRadarVehicles() {
+      panX = 0.0;
+      panY = 0.0;
+    }
+
+    // Mouse & Context Listeners
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+    canvas.addEventListener("mousedown", (e) => {
+      isDragging = true;
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+      if (radarMode === "3d" && (e.button === 2 || e.shiftKey)) {
+        dragMode = "pan";
+      } else if (radarMode === "3d" && e.button === 0) {
+        dragMode = "orbit";
+      } else {
+        dragMode = "pan";
+      }
+    });
+
+    window.addEventListener("mousemove", (e) => {
+      if (!isDragging) return;
+      const dx = e.clientX - lastMouseX;
+      const dy = e.clientY - lastMouseY;
+      lastMouseX = e.clientX;
+      lastMouseY = e.clientY;
+
+      if (dragMode === "orbit") {
+        rotY += dx * 0.007;
+        rotX = Math.max(0.06, Math.min(1.50, rotX + dy * 0.007));
+      } else {
+        panX += dx;
+        panY += dy;
+      }
+    });
+
+    window.addEventListener("mouseup", () => {
+      isDragging = false;
+    });
+
+    canvas.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.15 : 0.87;
+      zoomRadar(factor);
+    }, { passive: false });
+
+    // Touch Support
+    let touchStartDist = 0;
+    canvas.addEventListener("touchstart", (e) => {
+      if (e.touches.length === 1) {
+        isDragging = true;
+        dragMode = (radarMode === "3d") ? "orbit" : "pan";
+        lastMouseX = e.touches[0].clientX;
+        lastMouseY = e.touches[0].clientY;
+      } else if (e.touches.length === 2) {
+        isDragging = false;
+        touchStartDist = Math.hypot(
+          e.touches[0].clientX - e.touches[1].clientX,
+          e.touches[0].clientY - e.touches[1].clientY
+        );
+      }
+    });
+
+    canvas.addEventListener("touchmove", (e) => {
+      if (e.touches.length === 1 && isDragging) {
+        const dx = e.touches[0].clientX - lastMouseX;
+        const dy = e.touches[0].clientY - lastMouseY;
+        lastMouseX = e.touches[0].clientX;
+        lastMouseY = e.touches[0].clientY;
+        if (dragMode === "orbit") {
+          rotY += dx * 0.007;
+          rotX = Math.max(0.06, Math.min(1.50, rotX + dy * 0.007));
+        } else {
+          panX += dx;
+          panY += dy;
+        }
+      } else if (e.touches.length === 2) {
+        const dist = Math.hypot(
+          e.touches[0].clientX - e.touches[1].clientX,
+          e.touches[0].clientY - e.touches[1].clientY
+        );
+        if (touchStartDist > 0) {
+          zoomRadar(dist / touchStartDist);
+          touchStartDist = dist;
+        }
+      }
+    });
+
+    canvas.addEventListener("touchend", () => {
+      isDragging = false;
+      touchStartDist = 0;
+    });
+
+    // 3D / Orthogonal Projection Function
+    function project3D(east, north, alt, w, h) {
+      const cx = w / 2 + panX;
+      const cy = h / 2 + panY;
+      const scale = (Math.min(w, h) / 1200.0) * radarZoom;
+
+      if (radarMode === "xy") {
+        return {
+          x: cx + east * scale,
+          y: cy - north * scale,
+          scale: scale
+        };
+      } else if (radarMode === "xz") {
+        return {
+          x: cx + east * scale,
+          y: cy - alt * scale,
+          scale: scale
+        };
+      } else if (radarMode === "yz") {
+        return {
+          x: cx + north * scale,
+          y: cy - alt * scale,
+          scale: scale
+        };
+      } else {
+        // 3D Orbital Projection
+        const cosY = Math.cos(rotY), sinY = Math.sin(rotY);
+        const x1 = east * cosY - north * sinY;
+        const y1 = east * sinY + north * cosY;
+        const z1 = alt;
+
+        const cosX = Math.cos(rotX), sinX = Math.sin(rotX);
+        const x2 = x1;
+        const y2 = y1 * cosX - z1 * sinX;
+        const z2 = y1 * sinX + z1 * cosX;
+
+        return {
+          x: cx + x2 * scale,
+          y: cy - z2 * scale,
+          scale: scale
+        };
+      }
+    }
+
+    // Main Tactical Radar Render Loop
     function drawRadar() {
       const w = canvas.width;
       const h = canvas.height;
       ctx.clearRect(0, 0, w, h);
 
-      // Center
-      const cx = w / 2;
-      const cy = h / 2;
-      const scale = (Math.min(w, h) / 1200.0) * radarZoom; // pixels per meter
+      const cx = w / 2 + panX;
+      const cy = h / 2 + panY;
+      const scale = (Math.min(w, h) / 1200.0) * radarZoom;
 
-      // Tactical Grid
-      ctx.strokeStyle = "rgba(0, 229, 255, 0.1)";
-      ctx.lineWidth = 1;
-
-      // Concentric Distance Rings (every 200m)
+      // 1. Draw Grid & Distance Rings
       const ringSteps = [100, 250, 500, 750, 1000];
-      for (const r of ringSteps) {
+
+      if (radarMode === "3d") {
+        // 3D Ground Plane Circles at Alt = 0
+        ctx.strokeStyle = "rgba(0, 229, 255, 0.12)";
+        ctx.lineWidth = 1;
+        for (const r of ringSteps) {
+          ctx.beginPath();
+          for (let a = 0; a <= 2 * Math.PI + 0.05; a += Math.PI / 24) {
+            const p = project3D(r * Math.sin(a), r * Math.cos(a), 0, w, h);
+            if (a === 0) ctx.moveTo(p.x, p.y);
+            else ctx.lineTo(p.x, p.y);
+          }
+          ctx.stroke();
+          // Distance ring label
+          const lp = project3D(r, 0, 0, w, h);
+          ctx.fillStyle = "rgba(0, 229, 255, 0.4)";
+          ctx.font = "10px monospace";
+          ctx.fillText(`${r}m`, lp.x + 3, lp.y - 3);
+        }
+
+        // 3D Ground Crosshairs
+        ctx.strokeStyle = "rgba(0, 229, 255, 0.18)";
         ctx.beginPath();
-        ctx.arc(cx, cy, r * scale, 0, 2 * Math.PI);
+        const pN = project3D(0, 1100, 0, w, h);
+        const pS = project3D(0, -1100, 0, w, h);
+        const pE = project3D(1100, 0, 0, w, h);
+        const pW = project3D(-1100, 0, 0, w, h);
+        ctx.moveTo(pS.x, pS.y); ctx.lineTo(pN.x, pN.y);
+        ctx.moveTo(pW.x, pW.y); ctx.lineTo(pE.x, pE.y);
         ctx.stroke();
 
-        ctx.fillStyle = "rgba(0, 229, 255, 0.4)";
+        // 3D Cardinal Labels
+        ctx.fillStyle = "rgba(0, 229, 255, 0.75)";
+        ctx.font = "bold 11px Rajdhani, sans-serif";
+        ctx.fillText("N (KUZEY)", pN.x - 18, pN.y - 6);
+        ctx.fillText("S (GÜNEY)", pS.x - 18, pS.y + 14);
+        ctx.fillText("E (DOĞU)", pE.x + 6, pE.y + 4);
+        ctx.fillText("W (BATI)", pW.x - 44, pW.y + 4);
+
+      } else if (radarMode === "xy") {
+        // 2D Bird's eye Top-Down
+        ctx.strokeStyle = "rgba(0, 229, 255, 0.12)";
+        ctx.lineWidth = 1;
+        for (const r of ringSteps) {
+          ctx.beginPath();
+          ctx.arc(cx, cy, r * scale, 0, 2 * Math.PI);
+          ctx.stroke();
+          ctx.fillStyle = "rgba(0, 229, 255, 0.4)";
+          ctx.font = "10px monospace";
+          ctx.fillText(`${r}m`, cx + r * scale + 4, cy - 4);
+        }
+        ctx.beginPath();
+        ctx.moveTo(cx, 0); ctx.lineTo(cx, h);
+        ctx.moveTo(0, cy); ctx.lineTo(w, cy);
+        ctx.stroke();
+
+        ctx.fillStyle = "rgba(0, 229, 255, 0.8)";
+        ctx.font = "bold 12px Rajdhani, sans-serif";
+        ctx.fillText("N (KUZEY)", cx - 24, 20);
+        ctx.fillText("S (GÜNEY)", cx - 24, h - 10);
+        ctx.fillText("E (DOĞU)", w - 60, cy - 8);
+        ctx.fillText("W (BATI)", 10, cy - 8);
+
+      } else {
+        // XZ (Side) or YZ (Front) Profile
+        ctx.strokeStyle = "rgba(0, 229, 255, 0.3)";
+        ctx.lineWidth = 1.5;
+        // Ground horizon line (Alt = 0)
+        ctx.beginPath();
+        ctx.moveTo(0, cy); ctx.lineTo(w, cy);
+        ctx.stroke();
+        ctx.fillStyle = "rgba(0, 229, 255, 0.6)";
         ctx.font = "10px monospace";
-        ctx.fillText(`${r}m`, cx + r * scale + 4, cy - 4);
+        ctx.fillText("YER SEVİYESİ (0m)", 10, cy + 14);
+
+        // Altitude steps (50m, 100m, 150m, 200m)
+        [50, 100, 150, 200].forEach(alt => {
+          const sy = cy - alt * scale;
+          ctx.strokeStyle = "rgba(0, 229, 255, 0.1)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(0, sy); ctx.lineTo(w, sy);
+          ctx.stroke();
+          ctx.fillStyle = "rgba(0, 229, 255, 0.45)";
+          ctx.fillText(`+${alt}m`, 10, sy - 3);
+        });
+
+        // Vertical centerline
+        ctx.strokeStyle = "rgba(0, 229, 255, 0.15)";
+        ctx.beginPath();
+        ctx.moveTo(cx, 0); ctx.lineTo(cx, h);
+        ctx.stroke();
+
+        ctx.fillStyle = "rgba(0, 229, 255, 0.8)";
+        ctx.font = "bold 12px Rajdhani, sans-serif";
+        if (radarMode === "xz") {
+          ctx.fillText("E (DOĞU +)", w - 70, cy - 8);
+          ctx.fillText("W (BATI -)", 10, cy - 8);
+          ctx.fillText("İRTİFA (ALT)", cx + 6, 20);
+        } else {
+          ctx.fillText("N (KUZEY +)", w - 80, cy - 8);
+          ctx.fillText("S (GÜNEY -)", 10, cy - 8);
+          ctx.fillText("İRTİFA (ALT)", cx + 6, 20);
+        }
       }
-
-      // Compass Crosshairs
-      ctx.beginPath();
-      ctx.moveTo(cx, 0); ctx.lineTo(cx, h);
-      ctx.moveTo(0, cy); ctx.lineTo(w, cy);
-      ctx.stroke();
-
-      // Cardinal Labels
-      ctx.fillStyle = "rgba(0, 229, 255, 0.8)";
-      ctx.font = "bold 12px Rajdhani, sans-serif";
-      ctx.fillText("N (KUZEY)", cx - 24, 20);
-      ctx.fillText("S (GÜNEY)", cx - 24, h - 10);
-      ctx.fillText("E (DOĞU)", w - 60, cy - 8);
-      ctx.fillText("W (BATI)", 10, cy - 8);
 
       if (!latestData) {
         requestAnimationFrame(drawRadar);
@@ -992,41 +1438,101 @@ HTML_CONTENT = """<!DOCTYPE html>
       const trails = latestData.trails || {};
       const inter = latestData.interceptor;
       const talon = latestData.talon;
+      const tac = latestData.tactical || {};
 
-      // Transform world (East, North) -> screen (x, y)
-      // Screen X = cx + East * scale
-      // Screen Y = cy - North * scale
-      const toScreen = (east, north) => [cx + east * scale, cy - north * scale];
-
-      // Draw Talon Trail (Red)
+      // 2. Draw Long Fading Ribbon Trails
+      // Talon Ribbon Trail (Neon Red)
       if (trails.talon && trails.talon.length > 1) {
-        ctx.strokeStyle = "rgba(255, 68, 68, 0.6)";
-        ctx.lineWidth = 2;
-        ctx.setLineDash([4, 4]);
-        ctx.beginPath();
-        trails.talon.forEach((pt, i) => {
-          const [sx, sy] = toScreen(pt[0], pt[1]);
-          if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-        });
-        ctx.stroke();
-        ctx.setLineDash([]);
+        const N = trails.talon.length;
+        ctx.save();
+        ctx.shadowColor = "#ff2244";
+        ctx.shadowBlur = 8;
+        ctx.lineWidth = 1.8;
+        const segSize = Math.max(1, Math.floor(N / 12));
+        for (let i = 0; i < N - 1; i += segSize) {
+          const iNext = Math.min(N - 1, i + segSize);
+          const alpha = 0.06 + 0.88 * (iNext / N);
+          ctx.strokeStyle = `rgba(255, 51, 68, ${alpha.toFixed(2)})`;
+          ctx.beginPath();
+          for (let j = i; j <= iNext; j++) {
+            const pt = trails.talon[j];
+            const sp = project3D(pt[0], pt[1], pt[2] || 0, w, h);
+            if (j === i) ctx.moveTo(sp.x, sp.y);
+            else ctx.lineTo(sp.x, sp.y);
+          }
+          ctx.stroke();
+        }
+        ctx.restore();
       }
 
-      // Draw Interceptor Trail (Cyan)
+      // Interceptor Ribbon Trail (Neon Green)
       if (trails.interceptor && trails.interceptor.length > 1) {
-        ctx.strokeStyle = "rgba(0, 229, 255, 0.8)";
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        trails.interceptor.forEach((pt, i) => {
-          const [sx, sy] = toScreen(pt[0], pt[1]);
-          if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
-        });
-        ctx.stroke();
+        const N = trails.interceptor.length;
+        ctx.save();
+        ctx.shadowColor = "#00ff66";
+        ctx.shadowBlur = 8;
+        ctx.lineWidth = 1.8;
+        const segSize = Math.max(1, Math.floor(N / 12));
+        for (let i = 0; i < N - 1; i += segSize) {
+          const iNext = Math.min(N - 1, i + segSize);
+          const alpha = 0.06 + 0.88 * (iNext / N);
+          ctx.strokeStyle = `rgba(0, 255, 102, ${alpha.toFixed(2)})`;
+          ctx.beginPath();
+          for (let j = i; j <= iNext; j++) {
+            const pt = trails.interceptor[j];
+            const sp = project3D(pt[0], pt[1], pt[2] || 0, w, h);
+            if (j === i) ctx.moveTo(sp.x, sp.y);
+            else ctx.lineTo(sp.x, sp.y);
+          }
+          ctx.stroke();
+        }
+        ctx.restore();
       }
 
-      // Target Talon (Red Marker & 5m Capture Ring)
+      // 3. Ground Drop Lines & Shadows (3D Mode)
+      if (radarMode === "3d") {
+        if (talon.connected) {
+          const tp = project3D(talon.pos[1], talon.pos[0], talon.alt, w, h);
+          const gp = project3D(talon.pos[1], talon.pos[0], 0, w, h);
+          ctx.strokeStyle = "rgba(255, 51, 68, 0.35)";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath();
+          ctx.moveTo(tp.x, tp.y); ctx.lineTo(gp.x, gp.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          // Shadow ellipse
+          ctx.fillStyle = "rgba(255, 51, 68, 0.25)";
+          ctx.beginPath();
+          ctx.ellipse(gp.x, gp.y, 5, 2.5, 0, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+
+        if (inter.connected) {
+          const ip = project3D(inter.pos[1], inter.pos[0], inter.alt, w, h);
+          const gp = project3D(inter.pos[1], inter.pos[0], 0, w, h);
+          ctx.strokeStyle = "rgba(0, 255, 102, 0.35)";
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 3]);
+          ctx.beginPath();
+          ctx.moveTo(ip.x, ip.y); ctx.lineTo(gp.x, gp.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          // Shadow ellipse
+          ctx.fillStyle = "rgba(0, 255, 102, 0.25)";
+          ctx.beginPath();
+          ctx.ellipse(gp.x, gp.y, 5, 2.5, 0, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+      }
+
+      // 4. Vehicles Rendering
+      let tx = 0, ty = 0, ix = 0, iy = 0;
+
+      // Target Talon (Glowing Neon Red Dot)
       if (talon.connected) {
-        const [tx, ty] = toScreen(talon.pos[1], talon.pos[0]);
+        const tp = project3D(talon.pos[1], talon.pos[0], talon.alt, w, h);
+        tx = tp.x; ty = tp.y;
 
         // 5m Capture Circle
         ctx.strokeStyle = "rgba(0, 255, 136, 0.8)";
@@ -1037,55 +1543,100 @@ HTML_CONTENT = """<!DOCTYPE html>
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // Aircraft Icon (Triangle pointing along heading)
-        const rad = (90 - talon.heading) * Math.PI / 180.0;
-        ctx.save();
-        ctx.translate(tx, ty);
-        ctx.rotate(-rad + Math.PI / 2);
-        ctx.fillStyle = "#ff3b30";
+        // Glowing Red Halo Aura
+        const pulse = 1.0 + 0.2 * Math.sin(Date.now() * 0.007);
+        const glowR = 18 * pulse;
+        const gradTgt = ctx.createRadialGradient(tx, ty, 2, tx, ty, glowR);
+        gradTgt.addColorStop(0, "rgba(255, 51, 68, 0.95)");
+        gradTgt.addColorStop(0.4, "rgba(255, 51, 68, 0.45)");
+        gradTgt.addColorStop(1, "rgba(255, 51, 68, 0)");
+        ctx.fillStyle = gradTgt;
         ctx.beginPath();
-        ctx.moveTo(0, -10);
-        ctx.lineTo(8, 8);
-        ctx.lineTo(0, 4);
-        ctx.lineTo(-8, 8);
-        ctx.closePath();
+        ctx.arc(tx, ty, glowR, 0, 2 * Math.PI);
         ctx.fill();
-        ctx.restore();
+
+        // White Glowing Core Dot
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.arc(tx, ty, 4.5, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.strokeStyle = "#ff2244";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Heading Indicator Arrow
+        const radT = (90 - talon.heading) * Math.PI / 180.0;
+        ctx.strokeStyle = "#ff4d4d";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(tx, ty);
+        ctx.lineTo(tx + 16 * Math.cos(radT), ty - 16 * Math.sin(radT));
+        ctx.stroke();
 
         // Label
         ctx.fillStyle = "#ff6b6b";
         ctx.font = "bold 11px monospace";
-        ctx.fillText(`TALON [${talon.speed.toFixed(0)}m/s]`, tx + 12, ty - 6);
+        ctx.fillText(`TALON [${talon.speed.toFixed(0)}m/s | ${talon.alt.toFixed(0)}m]`, tx + 14, ty - 6);
       }
 
-      // Interceptor (Cyan Marker)
+      // Interceptor (Glowing Neon Green Dot)
       if (inter.connected) {
-        const [ix, iy] = toScreen(inter.pos[1], inter.pos[0]);
+        const ip = project3D(inter.pos[1], inter.pos[0], inter.alt, w, h);
+        ix = ip.x; iy = ip.y;
 
-        ctx.fillStyle = "#00e5ff";
+        // Glowing Green Halo Aura
+        const pulseInt = 1.0 + 0.2 * Math.sin(Date.now() * 0.007 + 1.2);
+        const glowRInt = 18 * pulseInt;
+        const gradInt = ctx.createRadialGradient(ix, iy, 2, ix, iy, glowRInt);
+        gradInt.addColorStop(0, "rgba(0, 255, 102, 0.95)");
+        gradInt.addColorStop(0.4, "rgba(0, 255, 102, 0.45)");
+        gradInt.addColorStop(1, "rgba(0, 255, 102, 0)");
+        ctx.fillStyle = gradInt;
         ctx.beginPath();
-        ctx.arc(ix, iy, 6, 0, 2 * Math.PI);
+        ctx.arc(ix, iy, glowRInt, 0, 2 * Math.PI);
         ctx.fill();
 
-        ctx.strokeStyle = "#ffffff";
-        ctx.lineWidth = 1.5;
+        // White Glowing Core Dot
+        ctx.fillStyle = "#ffffff";
+        ctx.beginPath();
+        ctx.arc(ix, iy, 4.5, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.strokeStyle = "#00ff66";
+        ctx.lineWidth = 2;
         ctx.stroke();
 
-        ctx.fillStyle = "#63b3ed";
-        ctx.font = "bold 11px monospace";
-        ctx.fillText(`OCTOPUS [${inter.speed.toFixed(0)}m/s]`, ix + 10, iy + 14);
+        // Heading Indicator Arrow
+        const intYaw = (inter.att && inter.att[2] !== undefined) ? inter.att[2] : 0.0;
+        const radI = (90 - intYaw) * Math.PI / 180.0;
+        ctx.strokeStyle = "#00ffaa";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(ix, iy);
+        ctx.lineTo(ix + 16 * Math.cos(radI), iy - 16 * Math.sin(radI));
+        ctx.stroke();
 
-        // Line-of-sight (LOS) from Interceptor to Talon
+        // Label
+        ctx.fillStyle = "#63e6be";
+        ctx.font = "bold 11px monospace";
+        ctx.fillText(`OCTOPUS [${inter.speed.toFixed(0)}m/s | ${inter.alt.toFixed(0)}m]`, ix + 14, iy + 14);
+
+        // Line-Of-Sight (LOS) from Interceptor to Talon
         if (talon.connected) {
-          const [tx, ty] = toScreen(talon.pos[1], talon.pos[0]);
-          ctx.strokeStyle = "rgba(255, 234, 0, 0.7)";
+          ctx.strokeStyle = "rgba(255, 234, 0, 0.75)";
           ctx.lineWidth = 1.5;
-          ctx.setLineDash([2, 4]);
+          ctx.setLineDash([3, 4]);
           ctx.beginPath();
           ctx.moveTo(ix, iy);
           ctx.lineTo(tx, ty);
           ctx.stroke();
           ctx.setLineDash([]);
+
+          // Midpoint distance label
+          const mx = (ix + tx) / 2;
+          const my = (iy + ty) / 2;
+          ctx.fillStyle = "rgba(255, 234, 0, 0.95)";
+          ctx.font = "bold 10px monospace";
+          ctx.fillText(`${tac.separation_distance ? tac.separation_distance.toFixed(1) : '---'}m`, mx + 6, my - 4);
         }
       }
 
