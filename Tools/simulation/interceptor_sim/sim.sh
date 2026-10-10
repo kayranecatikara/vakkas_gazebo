@@ -152,7 +152,7 @@ stop_previous() {
 		[ "${part}" = "${GZ_PARTITION:-}" ] && pids+=("${p}")
 	done
 
-	for p in $(pgrep -f "^${BUILD_DIR}/bin/px4 -i") $(pgrep -f "^python3 (-u )?${SCRIPT_DIR}/tools/(target_sim|ground_relay|sim_detector|view_hud).py"); do
+	for p in $(pgrep -f "^${BUILD_DIR}/bin/px4 -i") $(pgrep -f "^python3 (-u )?${SCRIPT_DIR}/tools/(target_sim|ground_relay|sim_detector|view_hud|web_gcs).py"); do
 		pids+=("${p}")
 	done
 
@@ -209,14 +209,14 @@ spawn "${TARGET_NAME}" talon1718 "${TARGET_POSE}" \
 if [ "${TARGET_AUTO:-1}" != "0" ]; then
 	mkdir -p "${SCRIPT_DIR}/build"
 	# shellcheck disable=SC2086
-	${PDEATH} python3 -u "${SCRIPT_DIR}/tools/target_sim.py" --world "${WORLD}" --model "${TARGET_NAME}" ${TARGET_ARGS} \
+	${PDEATH} python3 -u "${SCRIPT_DIR}/tools/target_sim.py" --world "${WORLD}" --model "${TARGET_NAME}" --pattern "${PATTERN:-square}" ${TARGET_ARGS} \
 		> "${SCRIPT_DIR}/build/target_sim.log" 2>&1 &
-	echo "Target: tools/target_sim.py in the background, log: ${SCRIPT_DIR}/build/target_sim.log"
-	echo "        position: http://localhost:8000/target (2 Hz), ADS-B in QGroundControl"
+	echo "Target:   tools/target_sim.py in the background, log: ${SCRIPT_DIR}/build/target_sim.log"
+	echo "          pattern: ${PATTERN:-square}, position: http://localhost:8000/target (2 Hz), ADS-B in QGroundControl"
 
 	if [ "${RELAY:-1}" != "0" ] && [ "${INTERCEPTOR}" != "0" ]; then
 		${PDEATH} python3 -u "${SCRIPT_DIR}/tools/ground_relay.py" > "${SCRIPT_DIR}/build/ground_relay.log" 2>&1 &
-		echo "Relay:  tools/ground_relay.py, FOLLOW_TARGET to the interceptor, log: ${SCRIPT_DIR}/build/ground_relay.log"
+		echo "Relay:    tools/ground_relay.py, FOLLOW_TARGET to the interceptor, log: ${SCRIPT_DIR}/build/ground_relay.log"
 	fi
 
 	if [ "${DETECTOR:-1}" != "0" ] && [ "${INTERCEPTOR}" != "0" ]; then
@@ -224,6 +224,12 @@ if [ "${TARGET_AUTO:-1}" != "0" ]; then
 			--interceptor "${INTERCEPTOR_NAME}" --target "${TARGET_NAME}" \
 			> "${SCRIPT_DIR}/build/sim_detector.log" 2>&1 &
 		echo "Detector: tools/sim_detector.py, ground-truth vision → udp 15600, log: ${SCRIPT_DIR}/build/sim_detector.log"
+	fi
+
+	if [ "${WEB_GCS:-1}" != "0" ]; then
+		${PDEATH} python3 -u "${SCRIPT_DIR}/tools/web_gcs.py" --port "${WEB_GCS_PORT:-8080}" \
+			> "${SCRIPT_DIR}/build/web_gcs.log" 2>&1 &
+		echo "Web GCS:  http://localhost:${WEB_GCS_PORT:-8080} (3D Tactical Radar & C2), log: ${SCRIPT_DIR}/build/web_gcs.log"
 	fi
 fi
 

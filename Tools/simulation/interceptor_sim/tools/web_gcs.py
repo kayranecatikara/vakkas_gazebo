@@ -18,6 +18,7 @@ import subprocess
 import urllib.request
 from collections import deque
 
+os.environ["GZ_IP"] = "127.0.0.1"
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 os.environ["MAVLINK20"] = "1"
 
