@@ -371,6 +371,7 @@ async def interceptor_cmd(payload: dict):
     px4cmd = os.path.join(SCRIPT_DIR, "px4cmd.sh")
 
     if action == "takeoff":
+        subprocess.Popen([px4cmd, "0", "commander", "arm"])
         cmd = [px4cmd, "0", "commander", "takeoff"]
     elif action == "intercept":
         cmd = [px4cmd, "0", "commander", "mode", "ext1"]
@@ -584,7 +585,7 @@ HTML_CONTENT = """<!DOCTYPE html>
           <!-- Joystick Base Container -->
           <div class="relative w-44 h-44 my-1 select-none flex items-center justify-center">
             <!-- Background Ring & Reticle -->
-            <div id="joy-base" class="w-40 h-40 rounded-full bg-slate-950/90 border-2 border-slate-700/80 relative overflow-hidden shadow-[inset_0_0_20px_rgba(0,0,0,0.8)] cursor-grab active:cursor-grabbing">
+            <div id="joy-base" class="w-40 h-40 rounded-full bg-slate-950/90 border-2 border-slate-700/80 relative overflow-hidden shadow-[inset_0_0_20px_rgba(0,0,0,0.8)] cursor-grab active:cursor-grabbing select-none" style="touch-action: none;">
               <!-- Radial Grid Lines -->
               <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
                 <div class="w-full h-[1px] bg-slate-800"></div>
@@ -794,7 +795,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     // --- WebSocket Telemetry Link ---
     let ws = null;
     let latestData = null;
-    let radarZoom = 1.0;
 
     function connectWebSocket() {
       const loc = window.location;
